@@ -11,50 +11,63 @@ class AR3DPaintPage extends StatefulWidget {
   State<AR3DPaintPage> createState() => _AR3DPaintPageState();
 }
 
-class _AR3DPaintPageState extends State<AR3DPaintPage> with WidgetsBindingObserver {
+class _AR3DPaintPageState extends State<AR3DPaintPage>
+    with SingleTickerProviderStateMixin {
   static const _ec = EventChannel('ar3d_paint/camera_pose');
-  Matrix4 _pose = Matrix4.identity();
+
+  Matrix4 _view = Matrix4.identity();
+  Matrix4 _proj = Matrix4.identity();
+  Vector3 _camPos = Vector3.zero();
+  Vector3 _forward = Vector3.zero();
+
   StreamSubscription? _sub;
   bool _tracking = false;
-  Vector3? _gridOrigin;
 
   final List<Stroke3D> _strokes = [];
   Stroke3D? _current;
   bool _drawing = false;
-  StrokeColor _color = StrokeColor.cyan;
-  double _size = 6.0;
-  Timer? _timer;
-  // showGrid=true  → mostra griglia 3D (sfondo scuro semi-trasparente)
-  // showGrid=false → sfondo trasparente, camera AR visibile
-  bool _showGrid = false;
 
-  static const _colors = {
-    'Ciano': StrokeColor.cyan,
-    'Rosso': StrokeColor.red,
-    'Verde': StrokeColor.green,
-    'Giallo': StrokeColor.yellow,
-    'Bianco': StrokeColor.white,
-    'Viola': StrokeColor.magenta,
-  };
+  StrokeColor _color = StrokeColor.cyan;
+  double _size = 6;
+  Timer? _timer;
+
+  // Animazione pulsante
+  late AnimationController _pulseCtrl;
+  late Animation<double> _pulseAnim;
+
+  static const _colorOptions = [
+    _ColorOption('Ciano',    StrokeColor.cyan,    Color(0xFF00FFFF)),
+    _ColorOption('Rosso',    StrokeColor.red,     Color(0xFFFF3366)),
+    _ColorOption('Verde',    StrokeColor.green,   Color(0xFF33FF99)),
+    _ColorOption('Giallo',   StrokeColor.yellow,  Color(0xFFFFE500)),
+    _ColorOption('Bianco',   StrokeColor.white,   Color(0xFFFFFFFF)),
+    _ColorOption('Viola',    StrokeColor.magenta, Color(0xFFCC00FF)),
+    _ColorOption('Arancio',  StrokeColor.orange,  Color(0xFFFF6600)),
+    _ColorOption('Azzurro',  StrokeColor.blue,    Color(0xFF0099FF)),
+  ];
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    )..repeat(reverse: true);
+    _pulseAnim = Tween(begin: 1.0, end: 1.12).animate(
+      CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+
     _sub = _ec.receiveBroadcastStream().listen((d) {
+      final map = (d as Map).cast<String, dynamic>();
       setState(() {
-        _pose = Matrix4.fromList((d as List).cast<double>());
-        if (!_tracking) {
-          // Prima pose valida: ancora la griglia 0.5m sotto la camera
-          _gridOrigin = Vector3(
-            _pose.entry(0, 3),
-            _pose.entry(1, 3) - 0.5,
-            _pose.entry(2, 3),
-          );
-        }
+        _view    = Matrix4.fromList((map['view']    as List).cast<double>());
+        _proj    = Matrix4.fromList((map['proj']    as List).cast<double>());
+        _camPos  = Vector3(map['pos'][0],     map['pos'][1],     map['pos'][2]);
+        _forward = Vector3(map['forward'][0], map['forward'][1], map['forward'][2]);
         _tracking = true;
       });
-    }, onError: (_) => setState(() => _tracking = false));
+    });
   }
 
   void _startDraw() {
@@ -62,17 +75,9 @@ class _AR3DPaintPageState extends State<AR3DPaintPage> with WidgetsBindingObserv
       _drawing = true;
       _current = Stroke3D(color: _color, width: _size);
     });
-    _timer = Timer.periodic(const Duration(milliseconds: 50), (_) {
-      if (!_drawing || _current == null) return;
-      // Punto 0.3m davanti alla camera lungo l'asse forward (+Z in ARCore)
-      final pos = _pose.getColumn(3);
-      final forward = Vector3(
-        _pose.entry(0, 2),
-        _pose.entry(1, 2),
-        _pose.entry(2, 2),
-      );
-      final paintPoint = Vector3(pos.x, pos.y, pos.z) + forward * 0.3;
-      setState(() => _current!.addPoint(paintPoint));
+    _timer = Timer.periodic(const Duration(milliseconds: 40), (_) {
+      if (!_drawing) return;
+      setState(() => _current!.addPoint(_camPos + _forward * 0.25));
     });
   }
 
@@ -89,167 +94,324 @@ class _AR3DPaintPageState extends State<AR3DPaintPage> with WidgetsBindingObserv
   void dispose() {
     _sub?.cancel();
     _timer?.cancel();
-    WidgetsBinding.instance.removeObserver(this);
+    _pulseCtrl.dispose();
     super.dispose();
   }
+
+  Color get _currentFlutterColor =>
+      _colorOptions.firstWhere((o) => o.color == _color).display;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // Trasparente quando camera attiva, scuro quando griglia attiva
-      backgroundColor: _showGrid ? Colors.black87 : Colors.transparent,
+      backgroundColor: Colors.transparent,
       body: Stack(children: [
 
-        // Painter 3D (griglia + stroke)
+        // ── Painter 3D ──────────────────────────────────────────────
         Painter3D(
           strokes: _strokes,
           currentStroke: _current,
-          cameraPose: _pose,
-          showGrid: _showGrid,
-          gridOrigin: _gridOrigin,
+          viewMatrix: _view,
+          projMatrix: _proj,
         ),
 
-        // Banner inizializzazione AR (piccolo, non bloccante)
+        // ── Mirino centrale ─────────────────────────────────────────
+        Center(child: _Crosshair(active: _drawing, color: _currentFlutterColor)),
+
+        // ── Banner tracking ─────────────────────────────────────────
         if (!_tracking)
           Positioned(
-            top: 80, left: 0, right: 0,
-            child: Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  SizedBox(width: 12, height: 12,
-                    child: CircularProgressIndicator(color: Colors.orange, strokeWidth: 2)),
-                  SizedBox(width: 8),
-                  Text('Inizializzando AR...', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                ]),
-              ),
-            ),
+            top: 60, left: 0, right: 0,
+            child: Center(child: _TrackingBanner()),
           ),
 
-        // UI overlay
+        // ── UI overlay ──────────────────────────────────────────────
         SafeArea(child: Column(children: [
+
           // Barra superiore
-          Padding(padding: const EdgeInsets.all(12), child: Row(children: [
-            // Status badge
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: Colors.white24),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+            child: Row(children: [
+              // Badge stato
+              _StatusBadge(tracking: _tracking, drawing: _drawing),
+              const Spacer(),
+              // Undo
+              _IconBtn(
+                icon: Icons.undo_rounded,
+                onTap: () {
+                  if (_strokes.isNotEmpty) setState(() => _strokes.removeLast());
+                },
               ),
-              child: Row(children: [
-                Container(width: 8, height: 8, decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: _tracking ? Colors.greenAccent : Colors.orange,
-                )),
-                const SizedBox(width: 8),
-                Text(_drawing ? 'Disegnando...' : 'AR 3D Paint',
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-              ])),
-            const Spacer(),
-            // Toggle griglia / camera reale
-            GestureDetector(
-              onTap: () => setState(() => _showGrid = !_showGrid),
-              child: Container(
-                width: 42, height: 42,
-                decoration: BoxDecoration(
-                  color: _showGrid ? Colors.white24 : Colors.black54,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white38)),
-                child: Icon(
-                  _showGrid ? Icons.grid_on : Icons.camera_alt_outlined,
-                  color: Colors.white, size: 20))),
-            const SizedBox(width: 8),
-            // Undo
-            GestureDetector(
-              onTap: () { if (_strokes.isNotEmpty) setState(() => _strokes.removeLast()); },
-              child: Container(width: 42, height: 42,
-                decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white24)),
-                child: const Icon(Icons.undo, color: Colors.white, size: 20))),
-            const SizedBox(width: 8),
-            // Clear
-            GestureDetector(
-              onTap: () => setState(() => _strokes.clear()),
-              child: Container(width: 42, height: 42,
-                decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white24)),
-                child: const Icon(Icons.delete_outline, color: Colors.white, size: 20))),
-          ])),
+              const SizedBox(width: 10),
+              // Clear
+              _IconBtn(
+                icon: Icons.delete_sweep_rounded,
+                onTap: () => setState(() => _strokes.clear()),
+              ),
+            ]),
+          ),
 
           const Spacer(),
 
-          // Selettore colori
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: Row(children: _colors.entries.map((e) {
-              final sel = e.value == _color;
-              final c = e.value.toFlutterColor();
-              return GestureDetector(
-                onTap: () => setState(() => _color = e.value),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 180),
-                  margin: const EdgeInsets.only(right: 12),
-                  width: sel ? 46 : 36, height: sel ? 46 : 36,
-                  decoration: BoxDecoration(
-                    color: c, shape: BoxShape.circle,
-                    border: Border.all(color: Colors.white, width: sel ? 3 : 1),
-                    boxShadow: sel ? [BoxShadow(color: c.withValues(alpha: 0.8), blurRadius: 12)] : [],
-                  )));
-            }).toList())),
+          // ── Selettore colori ──────────────────────────────────────
+          SizedBox(
+            height: 56,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              itemCount: _colorOptions.length,
+              itemBuilder: (_, i) {
+                final opt = _colorOptions[i];
+                final selected = opt.color == _color;
+                return GestureDetector(
+                  onTap: () => setState(() => _color = opt.color),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    curve: Curves.easeOut,
+                    margin: const EdgeInsets.only(right: 14),
+                    width:  selected ? 48 : 36,
+                    height: selected ? 48 : 36,
+                    decoration: BoxDecoration(
+                      color: opt.display,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: selected ? Colors.white : Colors.white30,
+                        width: selected ? 3 : 1,
+                      ),
+                      boxShadow: selected
+                          ? [BoxShadow(color: opt.display.withValues(alpha: 0.7), blurRadius: 14)]
+                          : [],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
 
-          const SizedBox(height: 16),
+          const SizedBox(height: 20),
 
-          // Controlli taglia e pulsante disegno
+          // ── Taglia + pulsante disegno ─────────────────────────────
           Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            GestureDetector(
-              onTap: () => setState(() => _size = 4.0),
-              child: Container(width: 44, height: 44,
-                decoration: BoxDecoration(
-                  color: _size == 4.0 ? Colors.white24 : Colors.black54,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white38)),
-                child: const Center(child: Text('S', style: TextStyle(color: Colors.white))))),
-            const SizedBox(width: 16),
-            // Pulsante disegno principale
+
+            // S
+            _SizeBtn(label: 'S', selected: _size == 4,
+              onTap: () => setState(() => _size = 4)),
+
+            const SizedBox(width: 20),
+
+            // Pulsante principale
             GestureDetector(
               onTapDown: (_) => _startDraw(),
-              onTapUp: (_) => _stopDraw(),
-              onTapCancel: () => _stopDraw(),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 150),
-                width: _drawing ? 88 : 76, height: _drawing ? 88 : 76,
-                decoration: BoxDecoration(
-                  color: _drawing ? _color.toFlutterColor() : Colors.white,
-                  shape: BoxShape.circle,
-                  boxShadow: [BoxShadow(
-                    color: _drawing
-                      ? _color.toFlutterColor().withValues(alpha: 0.6)
-                      : Colors.white30,
-                    blurRadius: 20)]),
-                child: Icon(
-                  _drawing ? Icons.brush : Icons.brush_outlined,
-                  color: _drawing ? Colors.white : Colors.black,
-                  size: 34))),
-            const SizedBox(width: 16),
-            GestureDetector(
-              onTap: () => setState(() => _size = 10.0),
-              child: Container(width: 44, height: 44,
-                decoration: BoxDecoration(
-                  color: _size == 10.0 ? Colors.white24 : Colors.black54,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white38)),
-                child: const Center(child: Text('L', style: TextStyle(color: Colors.white))))),
+              onTapUp:   (_) => _stopDraw(),
+              onTapCancel:   () => _stopDraw(),
+              child: AnimatedBuilder(
+                animation: _pulseAnim,
+                builder: (_, child) {
+                  final scale = _drawing ? _pulseAnim.value : 1.0;
+                  return Transform.scale(scale: scale, child: child);
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  width: 82, height: 82,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _drawing ? _currentFlutterColor : Colors.white,
+                    boxShadow: [
+                      BoxShadow(
+                        color: _drawing
+                            ? _currentFlutterColor.withValues(alpha: 0.6)
+                            : Colors.white.withValues(alpha: 0.25),
+                        blurRadius: 24,
+                        spreadRadius: 2,
+                      )
+                    ],
+                  ),
+                  child: Icon(
+                    _drawing ? Icons.brush_rounded : Icons.brush_outlined,
+                    size: 36,
+                    color: _drawing ? Colors.white : Colors.black87,
+                  ),
+                ),
+              ),
+            ),
+
+            const SizedBox(width: 20),
+
+            // L
+            _SizeBtn(label: 'L', selected: _size == 12,
+              onTap: () => setState(() => _size = 12)),
           ]),
-          const SizedBox(height: 28),
+
+          const SizedBox(height: 32),
         ])),
       ]),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Widget ausiliari
+// ─────────────────────────────────────────────────────────────
+
+class _ColorOption {
+  final String name;
+  final StrokeColor color;
+  final Color display;
+  const _ColorOption(this.name, this.color, this.display);
+}
+
+class _Crosshair extends StatelessWidget {
+  final bool active;
+  final Color color;
+  const _Crosshair({required this.active, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      width: active ? 28 : 22,
+      height: active ? 28 : 22,
+      child: CustomPaint(painter: _CrosshairPainter(active: active, color: color)),
+    );
+  }
+}
+
+class _CrosshairPainter extends CustomPainter {
+  final bool active;
+  final Color color;
+  _CrosshairPainter({required this.active, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..color = active ? color : Colors.white.withValues(alpha: 0.8)
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round;
+    final cx = size.width / 2, cy = size.height / 2;
+    final arm = size.width * 0.28;
+    canvas.drawLine(Offset(cx - arm, cy), Offset(cx - 3, cy), p);
+    canvas.drawLine(Offset(cx + 3, cy), Offset(cx + arm, cy), p);
+    canvas.drawLine(Offset(cx, cy - arm), Offset(cx, cy - 3), p);
+    canvas.drawLine(Offset(cx, cy + 3), Offset(cx, cy + arm), p);
+    canvas.drawCircle(Offset(cx, cy), 2.2, Paint()..color = p.color);
+  }
+
+  @override
+  bool shouldRepaint(_CrosshairPainter o) => o.active != active || o.color != color;
+}
+
+class _TrackingBanner extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.4)),
+      ),
+      child: const Row(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(width: 13, height: 13,
+          child: CircularProgressIndicator(
+            color: Colors.orange, strokeWidth: 2)),
+        SizedBox(width: 10),
+        Text('Inizializzando AR…',
+          style: TextStyle(color: Colors.white70, fontSize: 13,
+            fontWeight: FontWeight.w500)),
+      ]),
+    );
+  }
+}
+
+class _StatusBadge extends StatelessWidget {
+  final bool tracking, drawing;
+  const _StatusBadge({required this.tracking, required this.drawing});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          width: 8, height: 8,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: tracking ? Colors.greenAccent : Colors.orange,
+            boxShadow: [BoxShadow(
+              color: tracking
+                  ? Colors.greenAccent.withValues(alpha: 0.6)
+                  : Colors.orange.withValues(alpha: 0.5),
+              blurRadius: 6)],
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          drawing ? 'Disegnando…' : 'AR 3D Paint',
+          style: const TextStyle(color: Colors.white,
+            fontWeight: FontWeight.w600, fontSize: 14),
+        ),
+      ]),
+    );
+  }
+}
+
+class _IconBtn extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  const _IconBtn({required this.icon, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 44, height: 44,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.5),
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white24),
+        ),
+        child: Icon(icon, color: Colors.white, size: 20),
+      ),
+    );
+  }
+}
+
+class _SizeBtn extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _SizeBtn({required this.label, required this.selected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        width: 46, height: 46,
+        decoration: BoxDecoration(
+          color: selected
+              ? Colors.white.withValues(alpha: 0.2)
+              : Colors.black.withValues(alpha: 0.5),
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: selected ? Colors.white60 : Colors.white24,
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Center(child: Text(label,
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight: selected ? FontWeight.bold : FontWeight.w400,
+            fontSize: 15))),
+      ),
     );
   }
 }
