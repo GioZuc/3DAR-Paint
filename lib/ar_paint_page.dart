@@ -113,6 +113,7 @@ class _AR3DPaintPageState extends State<AR3DPaintPage>
           currentStroke: _current,
           viewMatrix: _view,
           projMatrix: _proj,
+            camPos: _camPos,
         ),
 
         // ── Mirino centrale ─────────────────────────────────────────
