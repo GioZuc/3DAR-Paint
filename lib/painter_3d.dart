@@ -1,300 +1,527 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
-import 'package:vector_math/vector_math_64.dart' hide Colors;
+import 'package:vector_math/vector_math_64.dart';
 import 'stroke_model.dart';
 
 class Painter3D extends StatelessWidget {
+  final List<Shape3D> shapes;
+  final ShapePreview? preview;
+  final Matrix4 viewMatrix;
+  final Matrix4 projMatrix;
+  final Vector3 camPos;
+  final Vector3 forward;
 
-final List<Stroke3D> strokes;
+  const Painter3D({
+    super.key,
+    required this.shapes,
+    required this.preview,
+    required this.viewMatrix,
+    required this.projMatrix,
+    required this.camPos,
+    required this.forward,
+  });
 
-final Stroke3D? currentStroke;
-
-final Matrix4 viewMatrix;
-
-final Matrix4 projMatrix;
-
-final Vector3 camPos;
-
-const Painter3D({
-
-super.key,
-
-required this.strokes,
-
-required this.currentStroke,
-
-required this.viewMatrix,
-
-required this.projMatrix,
-
-required this.camPos
-
-});
-
-@override
-Widget build(BuildContext context){
-
-return CustomPaint(
-
-painter:_Painter3D(
-
-strokes,
-currentStroke,
-viewMatrix,
-projMatrix
-
-),
-
-child:const SizedBox.expand()
-
-);
-
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _Painter3D(
+        shapes,
+        preview,
+        viewMatrix,
+        projMatrix,
+        camPos,
+        forward,
+      ),
+      child: const SizedBox.expand(),
+    );
+  }
 }
 
-}
+// ───────────────────────────────────────────────
 
-class _Painter3D extends CustomPainter{
+class _Painter3D extends CustomPainter {
 
-final List<Stroke3D> strokes;
+  final List<Shape3D> shapes;
+  final ShapePreview? preview;
+  final Matrix4 view;
+  final Matrix4 proj;
+  final Vector3 camPos;
+  final Vector3 forward;
 
-final Stroke3D? current;
+  late final Vector3 _cursor;
 
-final Matrix4 view;
+  _Painter3D(
+      this.shapes,
+      this.preview,
+      this.view,
+      this.proj,
+      this.camPos,
+      this.forward){
 
-final Matrix4 proj;
+    _cursor = camPos + forward * 0.25;
+  }
 
-_Painter3D(
+  Vector4 _toCam(Vector3 p){
+    return view.transform(Vector4(p.x,p.y,p.z,1));
+  }
 
-this.strokes,
-this.current,
-this.view,
-this.proj
+  Offset? _project(Vector3 p,Size size){
 
-);
+    final cam=_toCam(p);
 
-Vector4 _toCameraSpace(Vector3 p){
+    if(cam.z>0) return null;
 
-return view.transform(
+    final clip=proj.transform(cam);
 
-Vector4(
+    if(clip.w==0) return null;
 
-p.x,
-p.y,
-p.z,
-1
+    final sx=(clip.x/clip.w*0.5+0.5)*size.width;
+    final sy=(-clip.y/clip.w*0.5+0.5)*size.height;
 
-)
+    return Offset(sx,sy);
+  }
 
-);
+  double _pw(double base,double depth){
 
-}
+    depth=depth.clamp(0.02,50.0);
 
-double _perspectiveWidth(
+    final s=0.25/depth;
 
-double base,
-double depth
+    return (base*s*s*1.4).clamp(
+        base*0.08,
+        base*60
+    );
+  }
 
-){
+  Color _depthColor(Color c,double depth){
 
-// evita divisioni instabili
-depth = depth.clamp(
-0.02,
-50.0
-);
+    depth=depth.clamp(0.01,20.0);
 
-// distanza riferimento AR realistica
-const refDepth = 0.25;
+    final b=(0.25/depth).clamp(0.15,1.0);
 
-// prospettiva reale (camera model)
-final scale = refDepth / depth;
+    return Color.fromRGBO(
 
-// curva più naturale
-final perspective = scale * scale * 1.4;
+      (c.r*255*b).round().clamp(0,255),
 
-double width = base * perspective;
+      (c.g*255*b).round().clamp(0,255),
 
-// range realistico AR
-return width.clamp(
+      (c.b*255*b).round().clamp(0,255),
 
-base * 0.08,
-base * 60
+      c.opacity,
+    );
+  }
 
-);
+  // FIX COLORI
+  Color _proximity(Color c,double dist){
 
-}
+    final boost=(1.0-(dist/0.15).clamp(0.0,1.0))*0.25;
 
-Offset? _project(
+    if(boost<=0) return c;
 
-Vector3 p,
-Size size
+    return Color.fromRGBO(
 
-){
+      ((c.r+(1.0-c.r)*boost)*255)
+          .round()
+          .clamp(0,255),
 
-final cam=_toCameraSpace(p);
+      ((c.g+(1.0-c.g)*boost)*255)
+          .round()
+          .clamp(0,255),
 
-// dietro camera
-if(cam.z>0)return null;
+      ((c.b+(1.0-c.b)*boost)*255)
+          .round()
+          .clamp(0,255),
 
-final clip=proj.transform(cam);
+      c.opacity
+    );
+  }
 
-if(clip.w==0)return null;
+  Paint _segPaint(
+      Color base,
+      double avgDepth,
+      double width,
+      double proxDist){
 
-final ndcX=clip.x/clip.w;
+    final c=_proximity(
+        _depthColor(base,avgDepth),
+        proxDist
+    );
 
-final ndcY=clip.y/clip.w;
+    return Paint()
 
-final sx=
+      ..color=c
 
-(ndcX*0.5+0.5)
-*size.width;
+      ..strokeWidth=_pw(width,avgDepth)
 
-final sy=
+      ..strokeCap=StrokeCap.round
 
-(-ndcY*0.5+0.5)
-*size.height;
+      ..style=PaintingStyle.stroke;
+  }
 
-return Offset(
+  double _proxDist(List<Vector3> pts){
 
-sx,
-sy
+    double d=double.infinity;
 
-);
+    for(final p in pts){
 
-}
+      final v=(_cursor-p).length;
 
-void _drawStroke(
+      if(v<d) d=v;
+    }
 
-Canvas canvas,
-Size size,
-Stroke3D s
+    return d;
+  }
 
-){
+  // FREE STROKE
 
-if(s.points.length<2)return;
+  void _drawFree(
+      Canvas canvas,
+      Size size,
+      FreeStroke s){
 
-final paint=Paint()
+    if(s.points.length<2) return;
 
-..color=s.color.toFlutterColor()
+    final base=s.color.toFlutterColor();
 
-..strokeCap=StrokeCap.round
+    final dist=_proxDist(s.points);
 
-..style=PaintingStyle.stroke;
+    final paint=Paint()
+      ..strokeCap=StrokeCap.round
+      ..style=PaintingStyle.stroke;
 
-Offset? prev2D;
+    Offset? prev2D;
 
-Vector3? prev3D;
+    Vector3? prev3D;
 
-double prevWidth=s.width;
+    double prevW=s.width;
 
-for(final p in s.points){
+    for(final p in s.points){
 
-final cam=_toCameraSpace(p);
+      final cam=_toCam(p);
 
-final depth=-cam.z;
+      final depth=-cam.z;
 
-final pr=_project(
+      final pr=_project(p,size);
 
-p,
-size
+      if(pr==null){
 
-);
+        prev2D=null;
 
-if(pr==null){
+        prev3D=null;
 
-prev2D=null;
+        continue;
+      }
 
-prev3D=null;
+      if(prev2D!=null && prev3D!=null){
 
-continue;
+        final pd=-_toCam(prev3D).z;
 
-}
+        final avg=(pd+depth)*0.5;
 
-if(prev2D!=null && prev3D!=null){
+        final nw=_pw(s.width,avg);
 
-final prevCam=_toCameraSpace(prev3D);
+        final sw=prevW*0.82+nw*0.18;
 
-final prevDepth=-prevCam.z;
+        prevW=sw;
 
-// depth media segmento
-final avgDepth=
+        paint
 
-(prevDepth+depth)*0.5;
+          ..strokeWidth=sw
 
-final newWidth=
+          ..color=_proximity(
+              _depthColor(base,avg),
+              dist);
 
-_perspectiveWidth(
+        canvas.drawLine(prev2D,pr,paint);
+      }
 
-s.width,
-avgDepth
+      prev2D=pr;
 
-);
+      prev3D=p;
+    }
+  }
 
-// smoothing AR jitter
-final smoothWidth=
+  void _drawSegment(
+      Canvas canvas,
+      Size size,
+      Vector3 a,
+      Vector3 b,
+      Color base,
+      double width){
 
-prevWidth*0.82+
-newWidth*0.18;
+    final pa=_project(a,size);
 
-paint.strokeWidth=smoothWidth;
+    final pb=_project(b,size);
 
-canvas.drawLine(
+    if(pa==null||pb==null) return;
 
-prev2D,
-pr,
-paint
+    final da=-_toCam(a).z;
 
-);
+    final db=-_toCam(b).z;
 
-prevWidth=smoothWidth;
+    final avg=(da+db)*0.5;
 
-}
+    final dist=_proxDist([a,b]);
 
-prev2D=pr;
+    canvas.drawLine(
+        pa,
+        pb,
+        _segPaint(base,avg,width,dist)
+    );
+  }
 
-prev3D=p;
+  void _drawSphere(
+      Canvas canvas,
+      Size size,
+      Vector3 center,
+      double radius,
+      Color base,
+      double width){
 
-}
+    const int segs=48;
 
-}
+    final dist=(_cursor-center).length;
 
-@override
-void paint(
+    void drawCircle(List<Vector3> pts){
 
-Canvas canvas,
-Size size
+      Offset? prev;
 
-){
+      for(int i=0;i<=segs;i++){
 
-for(final s in strokes){
+        final p=pts[i%segs];
 
-_drawStroke(
+        final pr=_project(p,size);
 
-canvas,
-size,
-s
+        if(pr==null){
 
-);
+          prev=null;
 
-}
+          continue;
+        }
 
-if(current!=null){
+        final depth=-_toCam(p).z;
 
-_drawStroke(
+        if(prev!=null){
 
-canvas,
-size,
-current!
+          canvas.drawLine(
 
-);
+              prev,
 
-}
+              pr,
 
-}
+              _segPaint(base,depth,width,dist)
+          );
+        }
 
-@override
-bool shouldRepaint(
+        prev=pr;
+      }
+    }
 
-covariant _Painter3D old
+    drawCircle(List.generate(segs,(i){
 
-)=>true;
+      final a=2*pi*i/segs;
 
+      return Vector3(
+
+          center.x+radius*cos(a),
+
+          center.y+radius*sin(a),
+
+          center.z
+      );
+    }));
+
+    drawCircle(List.generate(segs,(i){
+
+      final a=2*pi*i/segs;
+
+      return Vector3(
+
+          center.x+radius*cos(a),
+
+          center.y,
+
+          center.z+radius*sin(a)
+      );
+    }));
+
+    drawCircle(List.generate(segs,(i){
+
+      final a=2*pi*i/segs;
+
+      return Vector3(
+
+          center.x,
+
+          center.y+radius*cos(a),
+
+          center.z+radius*sin(a)
+      );
+    }));
+  }
+
+  void _drawBox(
+      Canvas canvas,
+      Size size,
+      Vector3 a,
+      Vector3 b,
+      Color base,
+      double width){
+
+    final box=Box3D(
+
+        a:a,
+        b:b,
+        color:StrokeColor(0,0,0),
+        width:width
+    );
+
+    final corners=box.corners;
+
+    final dist=_proxDist(corners);
+
+    for(final edge in Box3D.edges){
+
+      final p1=corners[edge[0]];
+
+      final p2=corners[edge[1]];
+
+      final pr1=_project(p1,size);
+
+      final pr2=_project(p2,size);
+
+      if(pr1==null||pr2==null) continue;
+
+      final d1=-_toCam(p1).z;
+
+      final d2=-_toCam(p2).z;
+
+      final avg=(d1+d2)*0.5;
+
+      canvas.drawLine(
+
+          pr1,
+
+          pr2,
+
+          _segPaint(base,avg,width,dist)
+      );
+    }
+  }
+
+  void _drawPreview(
+      Canvas canvas,
+      Size size,
+      ShapePreview pv){
+
+    final base=pv.color
+        .toFlutterColor()
+        .withValues(alpha:0.6);
+
+    switch(pv.mode){
+
+      case DrawMode.free:
+        break;
+
+      case DrawMode.segment:
+
+        _drawSegment(
+            canvas,
+            size,
+            pv.start,
+            pv.current,
+            base,
+            pv.width);
+
+        break;
+
+      case DrawMode.sphere:
+
+        final radius=(pv.current-pv.start).length;
+
+        if(radius>0.001){
+
+          _drawSphere(
+              canvas,
+              size,
+              pv.start,
+              radius,
+              base,
+              pv.width);
+        }
+
+        break;
+
+      case DrawMode.box:
+
+        _drawBox(
+            canvas,
+            size,
+            pv.start,
+            pv.current,
+            base,
+            pv.width);
+
+        break;
+    }
+  }
+
+  @override
+  void paint(Canvas canvas,Size size){
+
+    for(final s in shapes){
+
+      final base=s.color.toFlutterColor();
+
+      if(s is FreeStroke){
+
+        _drawFree(canvas,size,s);
+
+      }else if(s is Segment3D){
+
+        _drawSegment(
+            canvas,
+            size,
+            s.start,
+            s.end,
+            base,
+            s.width);
+
+      }else if(s is Sphere3D){
+
+        _drawSphere(
+            canvas,
+            size,
+            s.center,
+            s.radius,
+            base,
+            s.width);
+
+      }else if(s is Box3D){
+
+        _drawBox(
+            canvas,
+            size,
+            s.a,
+            s.b,
+            base,
+            s.width);
+      }
+    }
+
+    if(preview!=null){
+
+      _drawPreview(
+          canvas,
+          size,
+          preview!);
+    }
+  }
+
+  @override
+  bool shouldRepaint(
+      covariant _Painter3D old){
+
+    return true;
+  }
 }
